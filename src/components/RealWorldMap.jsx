@@ -48,12 +48,40 @@ const TILE_LAYERS = {
   }
 };
 
+// Color palettes for administrative subdivisions (Admin-1)
+const PROVINCE_PALETTES = [
+  { stroke: '#10b981', fill: '#059669' }, // Emerald
+  { stroke: '#06b6d4', fill: '#0891b2' }, // Cyan
+  { stroke: '#3b82f6', fill: '#2563eb' }, // Blue
+  { stroke: '#8b5cf6', fill: '#7c3aed' }, // Purple
+  { stroke: '#ec4899', fill: '#db2777' }, // Pink
+  { stroke: '#f59e0b', fill: '#d97706' }, // Amber
+  { stroke: '#14b8a6', fill: '#0d9488' }, // Teal
+  { stroke: '#6366f1', fill: '#4f46e5' }, // Indigo
+  { stroke: '#84cc16', fill: '#65a30d' }, // Lime
+  { stroke: '#f97316', fill: '#ea580c' }, // Orange
+];
+
+// Admin-1 regional dataset partition definitions with bounding boxes
+const ADMIN1_REGIONS_DEF = [
+  { key: 'europe', file: 'europe.geojson', minLng: -31.3, minLat: 34.0, maxLng: 45.0, maxLat: 72.0 },
+  { key: 'russia', file: 'russia.geojson', minLng: 19.0, minLat: 41.0, maxLng: 180.0, maxLat: 82.0 },
+  { key: 'south_america', file: 'south_america.geojson', minLng: -85.0, minLat: -56.0, maxLng: -34.0, maxLat: 13.0 },
+  { key: 'iran_iraq', file: 'iran_iraq.geojson', minLng: 38.0, minLat: 25.0, maxLng: 64.0, maxLat: 40.0 },
+  { key: 'turkey_levant', file: 'turkey_levant.geojson', minLng: 25.0, minLat: 29.0, maxLng: 45.0, maxLat: 43.0 },
+  { key: 'caucasus', file: 'caucasus.geojson', minLng: 39.0, minLat: 38.0, maxLng: 51.0, maxLat: 44.0 },
+  { key: 'central_asia', file: 'central_asia.geojson', minLng: 46.0, minLat: 29.0, maxLng: 88.0, maxLat: 56.0 },
+  { key: 'major_global', file: 'major_global.geojson', minLng: -180.0, minLat: -60.0, maxLng: 180.0, maxLat: 85.0 }
+];
+
 export default function RealWorldMap({
-  appMode, // 'climate' | 'history'
+  appMode, // 'climate' | 'history' | 'provinces'
   climateYear,
   currentYear,
   onSelectCity,
   onSelectEmpire,
+  onSelectProvince,
+  selectedProvince,
   focusedCoords,
   onOpenCitiesModal
 }) {
@@ -63,14 +91,20 @@ export default function RealWorldMap({
   const labelsTileLayerRef = useRef(null);
   const floodLayerGroupRef = useRef(null);
   const markersLayerGroupRef = useRef(null);
+  const admin1LayerGroupRef = useRef(null);
+  const admin1LabelsGroupRef = useRef(null);
+  const cachedGeoJsonRef = useRef(new Map());
 
   const [activeLayerType, setActiveLayerType] = useState('satellite');
   const [showLayerMenu, setShowLayerMenu] = useState(false);
   const [showCityMarkers, setShowCityMarkers] = useState(true);
   const [activeSpotlight, setActiveSpotlight] = useState('bangladesh');
+  const [currentZoom, setCurrentZoom] = useState(4);
 
   const climateMetrics = getClimateMetricsForYear(climateYear);
   const isClimate = appMode === 'climate';
+  const isProvinces = appMode === 'provinces';
+  const isHistory = appMode === 'history';
 
   // 1. Initialize Leaflet Map
   useEffect(() => {
@@ -107,10 +141,22 @@ export default function RealWorldMap({
     const markersGroup = L.layerGroup().addTo(map);
     markersLayerGroupRef.current = markersGroup;
 
+    const admin1Group = L.layerGroup().addTo(map);
+    admin1LayerGroupRef.current = admin1Group;
+
+    const admin1LabelsGroup = L.layerGroup().addTo(map);
+    admin1LabelsGroupRef.current = admin1LabelsGroup;
+
+    const onZoomOrMove = () => {
+      setCurrentZoom(map.getZoom());
+    };
+    map.on('zoomend moveend', onZoomOrMove);
+
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
     return () => {
       try {
+        map.off('zoomend moveend', onZoomOrMove);
         map.stop();
         map.remove();
       } catch (err) {
@@ -156,17 +202,17 @@ export default function RealWorldMap({
   // 3. Smooth Camera Fly-To
   useEffect(() => {
     if (!mapInstanceRef.current || !focusedCoords) return;
-    const [lat, lng] = focusedCoords;
+    const [lat, lng, zoomLevel] = focusedCoords;
     try {
       mapInstanceRef.current.stop();
-      mapInstanceRef.current.flyTo([lat, lng], 8, {
+      mapInstanceRef.current.flyTo([lat, lng], zoomLevel || (appMode === 'provinces' ? 7 : 8), {
         duration: 1.8,
         easeLinearity: 0.25
       });
     } catch (err) {
       // safe fallback
     }
-  }, [focusedCoords]);
+  }, [focusedCoords, appMode]);
 
   // 4. Update Dynamic Map Overlays with Smooth, Realistic Coastline Contours & Depth-Based Shading
   useEffect(() => {
@@ -285,7 +331,7 @@ export default function RealWorldMap({
           markersGroup.addLayer(marker);
         });
       }
-    } else {
+    } else if (appMode === 'history') {
       // --- WORLD HISTORY OVERLAYS ---
       const activeEmpires = getActiveEmpires(currentYear);
 
@@ -345,6 +391,228 @@ export default function RealWorldMap({
       });
     }
   }, [appMode, climateYear, currentYear, climateMetrics, isClimate, onSelectCity, onSelectEmpire, showCityMarkers]);
+
+  // 5. Dynamic Administrative Subdivisions (Admin-1) Viewport Rendering
+  useEffect(() => {
+    if (!mapInstanceRef.current || !admin1LayerGroupRef.current || !admin1LabelsGroupRef.current) return;
+
+    if (appMode !== 'provinces') {
+      admin1LayerGroupRef.current.clearLayers();
+      admin1LabelsGroupRef.current.clearLayers();
+      return;
+    }
+
+    let isCancelled = false;
+
+    const renderAdmin1 = async () => {
+      const map = mapInstanceRef.current;
+      if (!map) return;
+      const zoom = map.getZoom();
+      setCurrentZoom(zoom);
+
+      const admin1Group = admin1LayerGroupRef.current;
+      const labelsGroup = admin1LabelsGroupRef.current;
+      if (!admin1Group || !labelsGroup) return;
+
+      // If zoom is below 4.0, clear layers to prevent clutter and keep map snappy
+      if (zoom < 4.0) {
+        admin1Group.clearLayers();
+        labelsGroup.clearLayers();
+        return;
+      }
+
+      const mapBounds = map.getBounds();
+      // Pad viewport bounds by 15% for smooth panning
+      const padLng = (mapBounds.getEast() - mapBounds.getWest()) * 0.15;
+      const padLat = (mapBounds.getNorth() - mapBounds.getSouth()) * 0.15;
+      const vp = {
+        minLng: mapBounds.getWest() - padLng,
+        minLat: mapBounds.getSouth() - padLat,
+        maxLng: mapBounds.getEast() + padLng,
+        maxLat: mapBounds.getNorth() + padLat
+      };
+
+      // Determine matching regional files that intersect viewport
+      const matchingDefs = ADMIN1_REGIONS_DEF.filter(def => {
+        return !(def.minLng > vp.maxLng ||
+                 def.maxLng < vp.minLng ||
+                 def.minLat > vp.maxLat ||
+                 def.maxLat < vp.minLat);
+      });
+
+      // Parallel fetch cached
+      await Promise.all(matchingDefs.map(async def => {
+        if (!cachedGeoJsonRef.current.has(def.key)) {
+          try {
+            const res = await fetch(`/data/admin1/${def.file}`);
+            if (res.ok) {
+              const data = await res.json();
+              cachedGeoJsonRef.current.set(def.key, data);
+            }
+          } catch (e) {
+            console.error('Error fetching admin1 file', def.file, e);
+          }
+        }
+      }));
+
+      if (isCancelled || !mapInstanceRef.current || appMode !== 'provinces') return;
+
+      admin1Group.clearLayers();
+      labelsGroup.clearLayers();
+
+      const getColor = (str) => {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = str.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        return PROVINCE_PALETTES[Math.abs(hash) % PROVINCE_PALETTES.length];
+      };
+
+      matchingDefs.forEach(def => {
+        const geojson = cachedGeoJsonRef.current.get(def.key);
+        if (!geojson || !geojson.features) return;
+
+        geojson.features.forEach(feature => {
+          const p = feature.properties;
+          if (p.bbox) {
+            const [bMinLng, bMinLat, bMaxLng, bMaxLat] = p.bbox;
+            if (bMinLng > vp.maxLng || bMaxLng < vp.minLng || bMinLat > vp.maxLat || bMaxLat < vp.minLat) {
+              return;
+            }
+          } else if (p.lat && p.lng) {
+            if (p.lng > vp.maxLng || p.lng < vp.minLng || p.lat > vp.maxLat || p.lat < vp.minLat) {
+              return;
+            }
+          }
+
+          const isSelected = selectedProvince && (
+            (selectedProvince.code && selectedProvince.code === p.code) ||
+            (selectedProvince.name === p.name && selectedProvince.admin === p.admin)
+          );
+
+          const palette = getColor(p.name + p.admin);
+
+          const polyStyle = isSelected ? {
+            color: '#fef08a',
+            weight: 3.2,
+            opacity: 1,
+            fillColor: '#eab308',
+            fillOpacity: 0.55,
+            className: 'admin1-province-polygon selected-province-polygon'
+          } : {
+            color: palette.stroke,
+            weight: 1.6,
+            opacity: 0.85,
+            fillColor: palette.fill,
+            fillOpacity: 0.22,
+            className: 'admin1-province-polygon'
+          };
+
+          const poly = L.geoJSON(feature, {
+            style: () => polyStyle
+          });
+
+          poly.on('mouseover', (e) => {
+            if (!isSelected) {
+              e.target.setStyle({
+                weight: 2.8,
+                color: '#ffffff',
+                fillOpacity: 0.42
+              });
+              e.target.bringToFront();
+            }
+          });
+
+          poly.on('mouseout', (e) => {
+            if (!isSelected) {
+              poly.resetStyle(e.target);
+            }
+          });
+
+          poly.on('click', () => {
+            if (onSelectProvince) {
+              onSelectProvince(p);
+            }
+          });
+
+          const typeBadge = p.type || 'Subdivision';
+          const areaHtml = p.area_km2 > 0
+            ? `<div style="font-size: 9px; color: #94a3b8; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 3px; margin-top: 3px; display: flex; justify-content: space-between;"><span>Land Area:</span><strong style="color: #6ee7b7;">${p.area_km2.toLocaleString()} km²</strong></div>`
+            : '';
+          const localHtml = p.name_local && p.name_local !== p.name
+            ? ` • <span style="color: #94a3b8;">${p.name_local}</span>`
+            : '';
+
+          poly.bindTooltip(`
+            <div style="font-family: 'Plus Jakarta Sans', sans-serif; font-size: 11px; padding: 4px; min-width: 170px;">
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;">
+                <strong style="color: #6ee7b7; font-size: 12px;">${p.name}</strong>
+                <span style="font-size: 9px; background: rgba(16,185,129,0.25); color: #a7f3d0; padding: 1px 6px; border-radius: 6px; font-weight: bold;">
+                  ${typeBadge}
+                </span>
+              </div>
+              <div style="color: #cbd5e1; font-size: 10px; margin-bottom: 2px;">
+                <span>${p.admin}</span>${localHtml}
+              </div>
+              ${areaHtml}
+            </div>
+          `, {
+            className: 'admin1-leaflet-tooltip',
+            sticky: true,
+            direction: 'top',
+            offset: [0, -10]
+          });
+
+          admin1Group.addLayer(poly);
+
+          // Centered state name label without micro-location clutter
+          if (p.lat && p.lng) {
+            const shouldShowLabel = isSelected || zoom >= 5.5 || (p.area_km2 > 3500);
+            if (shouldShowLabel) {
+              const labelHtml = `
+                <div class="state-label-inner" style="
+                  font-family: 'Plus Jakarta Sans', sans-serif;
+                  font-size: ${zoom >= 7 ? '11px' : '9.5px'};
+                  font-weight: 700;
+                  color: ${isSelected ? '#fef08a' : '#f8fafc'};
+                  text-shadow: 0 1px 4px rgba(0,0,0,0.95), 0 0 6px rgba(0,0,0,0.85);
+                  background: ${isSelected ? 'rgba(234, 179, 8, 0.45)' : 'rgba(15, 23, 42, 0.78)'};
+                  border: 1px solid ${isSelected ? '#facc15' : 'rgba(255,255,255,0.22)'};
+                  padding: 2px 6px;
+                  border-radius: 5px;
+                  white-space: nowrap;
+                  pointer-events: none;
+                  letter-spacing: 0.02em;
+                  display: inline-block;
+                  box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+                ">
+                  ${p.name}
+                </div>
+              `;
+              const labelIcon = L.divIcon({
+                className: 'state-name-label',
+                html: labelHtml,
+                iconSize: [0, 0],
+                iconAnchor: [0, 0]
+              });
+              const marker = L.marker([p.lat, p.lng], { icon: labelIcon, interactive: false });
+              labelsGroup.addLayer(marker);
+            }
+          }
+        });
+      });
+    };
+
+    renderAdmin1();
+
+    const map = mapInstanceRef.current;
+    map.on('moveend zoomend', renderAdmin1);
+
+    return () => {
+      isCancelled = true;
+      map.off('moveend zoomend', renderAdmin1);
+    };
+  }, [appMode, selectedProvince]);
 
   // Quick Fly to Vulnerable Region
   const handleFlyToRegion = (coords, zoom = 7, spotlightKey = null) => {
@@ -442,172 +710,268 @@ export default function RealWorldMap({
         )}
       </div>
 
-      {/* Research-Based Quick Fly-To Hotspots Bar (Bottom Left) */}
-      <div className="absolute bottom-24 left-4 z-20 hidden md:flex items-center gap-1.5 p-1.5 rounded-2xl glass-panel border border-cyan-500/30 shadow-2xl bg-slate-950/90 pointer-events-auto flex-wrap max-w-3xl">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-cyan-400 px-2 flex items-center gap-1 font-bold">
-          <Navigation className="w-3 h-3 text-cyan-400" />
-          Hotspots:
-        </span>
-        <button
-          onClick={() => handleFlyToRegion([31.0, 31.0], 8, 'egypt')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
-            activeSpotlight === 'egypt'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
-              : 'text-cyan-200 bg-cyan-950/60 border border-cyan-500/40 hover:bg-cyan-900/80'
-          }`}
-          title="Zoom to Egypt (Alexandria & Nile Delta Inundation)"
-        >
-          🇪🇬 Egypt (Nile)
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([31.0, 47.0], 8, 'iraq')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
-            activeSpotlight === 'iraq'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
-              : 'text-cyan-200 bg-cyan-950/60 border border-cyan-500/40 hover:bg-cyan-900/80'
-          }`}
-          title="Zoom to Iraq (Tigris-Euphrates Valleys & Basra Inundation)"
-        >
-          🇮🇶 Iraq (Tigris)
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([22.8, 90.2], 8, 'bangladesh')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
-            activeSpotlight === 'bangladesh'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Bangladesh Delta (Watch water creep inland stage by stage!)"
-        >
-          🇧🇩 Bangladesh
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([10.2, 105.8], 8, 'vietnam')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
-            activeSpotlight === 'vietnam'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Vietnam Mekong Delta (70% drowned by +2.8m!)"
-        >
-          🇻🇳 Vietnam
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([-29.5, 137.5], 6, 'australia')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
-            activeSpotlight === 'australia'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Australia (Lake Eyre Basin Inland Sea & Spencer Gulf)"
-        >
-          🇦🇺 Australia (Lake Eyre)
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([14.8, 120.8], 8, 'philippines')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'philippines'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Philippines (Manila Bay & Central Luzon Channel)"
-        >
-          🇵🇭 Philippines
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([45.4387, 12.3271], 10, 'venice')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'venice'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Venice & Po Valley (submerged at +1.1m; 63m deep at 7000y!)"
-        >
-          Venice (Italy)
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([26.5, -81.5], 7, 'florida')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'florida'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Florida Peninsula (erased at +68m)"
-        >
-          Florida
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([-2.5, -54.5], 6, 'amazon')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'amazon'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Amazon Basin (river trough floods, Brazilian Highlands remain DRY!)"
-        >
-          Amazon (Brazil)
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([52.5, 5.0], 8, 'netherlands')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'netherlands'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Netherlands & Flanders"
-        >
-          Netherlands
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([31.2, 121.5], 8, 'shanghai')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'shanghai'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Shanghai & Yangtze River Plain"
-        >
-          🇨🇳 Shanghai
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([51.5, 0.0], 9, 'london')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'london'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to London & Thames Estuary"
-        >
-          🇬🇧 London
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([6.5, 3.4], 9, 'lagos')}
-          className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
-            activeSpotlight === 'lagos'
-              ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
-              : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
-          }`}
-          title="Zoom to Lagos & Niger Delta (West Africa)"
-        >
-          🇳🇬 Lagos
-        </button>
-        <button
-          onClick={() => handleFlyToRegion([20, 0], 3, null)}
-          className="px-2.5 py-1 rounded-xl text-xs font-mono text-cyan-300 hover:bg-cyan-950/60 font-bold transition-colors"
-          title="Reset to Global World View"
-        >
-          ⟲ World
-        </button>
-        {onOpenCitiesModal && isClimate && (
+      {/* Research-Based Quick Fly-To Hotspots Bar (Bottom Left) - Climate Mode Only */}
+      {isClimate && (
+        <div className="absolute bottom-24 left-4 z-20 hidden md:flex items-center gap-1.5 p-1.5 rounded-2xl glass-panel border border-cyan-500/30 shadow-2xl bg-slate-950/90 pointer-events-auto flex-wrap max-w-3xl">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-cyan-400 px-2 flex items-center gap-1 font-bold">
+            <Navigation className="w-3 h-3 text-cyan-400" />
+            Hotspots:
+          </span>
           <button
-            onClick={onOpenCitiesModal}
-            className="ml-1 px-3 py-1 rounded-xl text-xs font-mono font-bold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-400/50 transition-all flex items-center gap-1 shadow-sm"
-            title="Open Complete Research Directory of all 52 Global Inundation Regions"
+            onClick={() => handleFlyToRegion([31.0, 31.0], 8, 'egypt')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
+              activeSpotlight === 'egypt'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
+                : 'text-cyan-200 bg-cyan-950/60 border border-cyan-500/40 hover:bg-cyan-900/80'
+            }`}
+            title="Zoom to Egypt (Alexandria & Nile Delta Inundation)"
           >
-            <span>📊 Global Directory</span>
+            🇪🇬 Egypt (Nile)
           </button>
-        )}
-      </div>
+          <button
+            onClick={() => handleFlyToRegion([31.0, 47.0], 8, 'iraq')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
+              activeSpotlight === 'iraq'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
+                : 'text-cyan-200 bg-cyan-950/60 border border-cyan-500/40 hover:bg-cyan-900/80'
+            }`}
+            title="Zoom to Iraq (Tigris-Euphrates Valleys & Basra Inundation)"
+          >
+            🇮🇶 Iraq (Tigris)
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([22.8, 90.2], 8, 'bangladesh')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
+              activeSpotlight === 'bangladesh'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Bangladesh Delta (Watch water creep inland stage by stage!)"
+          >
+            🇧🇩 Bangladesh
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([10.2, 105.8], 8, 'vietnam')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
+              activeSpotlight === 'vietnam'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Vietnam Mekong Delta (70% drowned by +2.8m!)"
+          >
+            🇻🇳 Vietnam
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([-29.5, 137.5], 6, 'australia')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors font-bold ${
+              activeSpotlight === 'australia'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60 shadow-lg'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Australia (Lake Eyre Basin Inland Sea & Spencer Gulf)"
+          >
+            🇦🇺 Australia (Lake Eyre)
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([14.8, 120.8], 8, 'philippines')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'philippines'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Philippines (Manila Bay & Central Luzon Channel)"
+          >
+            🇵🇭 Philippines
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([45.4387, 12.3271], 10, 'venice')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'venice'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Venice & Po Valley (submerged at +1.1m; 63m deep at 7000y!)"
+          >
+            Venice (Italy)
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([26.5, -81.5], 7, 'florida')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'florida'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Florida Peninsula (erased at +68m)"
+          >
+            Florida
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([-2.5, -54.5], 6, 'amazon')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'amazon'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Amazon Basin (river trough floods, Brazilian Highlands remain DRY!)"
+          >
+            Amazon (Brazil)
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([52.5, 5.0], 8, 'netherlands')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'netherlands'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Netherlands & Flanders"
+          >
+            Netherlands
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([31.2, 121.5], 8, 'shanghai')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'shanghai'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Shanghai & Yangtze River Plain"
+          >
+            🇨🇳 Shanghai
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([51.5, 0.0], 9, 'london')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'london'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to London & Thames Estuary"
+          >
+            🇬🇧 London
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([6.5, 3.4], 9, 'lagos')}
+            className={`px-2.5 py-1 rounded-xl text-xs font-mono transition-colors ${
+              activeSpotlight === 'lagos'
+                ? 'bg-cyan-500/30 text-cyan-200 border border-cyan-400/60'
+                : 'text-slate-200 hover:text-cyan-200 hover:bg-cyan-950/50'
+            }`}
+            title="Zoom to Lagos & Niger Delta (West Africa)"
+          >
+            🇳🇬 Lagos
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([20, 0], 3, null)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono text-cyan-300 hover:bg-cyan-950/60 font-bold transition-colors"
+            title="Reset to Global World View"
+          >
+            ⟲ World
+          </button>
+          {onOpenCitiesModal && isClimate && (
+            <button
+              onClick={onOpenCitiesModal}
+              className="ml-1 px-3 py-1 rounded-xl text-xs font-mono font-bold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-400/50 transition-all flex items-center gap-1 shadow-sm"
+              title="Open Complete Research Directory of all 52 Global Inundation Regions"
+            >
+              <span>📊 Global Directory</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Provinces Mode: Regional Quick-Jump Navigator (Bottom Left) */}
+      {isProvinces && (
+        <div className="absolute bottom-6 left-4 z-20 flex items-center gap-1.5 p-2 rounded-2xl glass-panel border border-emerald-500/40 shadow-2xl bg-slate-950/90 pointer-events-auto flex-wrap max-w-4xl">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-emerald-400 px-2 flex items-center gap-1 font-bold">
+            <Navigation className="w-3.5 h-3.5 text-emerald-400" />
+            Explore Regions:
+          </span>
+          <button
+            onClick={() => handleFlyToRegion([50.0, 14.0], 5)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore all European states & provinces (Germany, France, UK, Italy, Spain, Poland, etc.)"
+          >
+            🇪🇺 Europe
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([58.0, 56.0], 4)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore all 86 Russian Federal Subjects (Oblasts, Republics, Krais)"
+          >
+            🇷🇺 Russia
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([-16.0, -58.0], 4)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore South American states (Brazil, Argentina, Colombia, Chile, Peru)"
+          >
+            🇧🇷 South America
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([32.4, 53.7], 6)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore Iran's 31 Provinces (Ostans)"
+          >
+            🇮🇷 Iran
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([33.2, 43.7], 6)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore Iraq's 18 Governorates"
+          >
+            🇮🇶 Iraq
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([39.0, 35.2], 6)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore Turkey's 81 Provinces (Iller)"
+          >
+            🇹🇷 Turkey
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([33.9, 67.7], 6)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore Afghanistan's 34 Provinces (Velayat)"
+          >
+            🇦🇫 Afghanistan
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([44.0, 66.0], 5)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore Central Asia (Kazakhstan, Uzbekistan, Turkmenistan, Kyrgyzstan, Tajikistan)"
+          >
+            🇰🇿 Central Asia
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([32.5, 36.0], 7)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore Jordan & Lebanon Governorates"
+          >
+            🇯🇴 Jordan & Lebanon
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([41.7, 44.8], 7)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore the Caucasus (Georgia, Armenia, Azerbaijan)"
+          >
+            🇬🇪 Caucasus
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([38.0, -97.0], 4)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono font-bold bg-emerald-950/60 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/80 transition-colors"
+            title="Explore US States & North America"
+          >
+            🇺🇸 USA
+          </button>
+          <button
+            onClick={() => handleFlyToRegion([25, 45], 3)}
+            className="px-2.5 py-1 rounded-xl text-xs font-mono text-emerald-300 hover:bg-emerald-950/60 font-bold transition-colors"
+            title="Reset to World Overview"
+          >
+            ⟲ World
+          </button>
+        </div>
+      )}
 
       {/* Dynamic Regional Spotlight HUD Card: EGYPT */}
       {isClimate && activeSpotlight === 'egypt' && (
@@ -1037,6 +1401,28 @@ export default function RealWorldMap({
               <span className="w-3 h-2 rounded bg-[#021a36] inline-block border border-cyan-400/40" />
               <span className="text-cyan-200 font-bold">Dark Abyssal Navy (&gt;30m)</span>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Provinces Mode: Top Status HUD Banner */}
+      {isProvinces && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20 glass-panel px-4 py-2 rounded-2xl border border-emerald-400/40 shadow-xl bg-slate-950/90 hidden sm:flex items-center gap-3 text-xs font-mono pointer-events-auto">
+          <div className="flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="text-slate-300 font-semibold">Subdivision Mode:</span>
+            <span className="text-emerald-300 font-bold">Admin-1 Borders</span>
+          </div>
+          <span className="text-slate-500">|</span>
+          <div className="flex items-center gap-1 text-slate-300">
+            <span>Zoom Level:</span>
+            <span className="text-emerald-400 font-bold">{currentZoom.toFixed(1)}x</span>
+          </div>
+          <span className="text-slate-500">|</span>
+          <div className="text-[11px] text-slate-400">
+            {currentZoom < 4.0
+              ? '🔍 Zoom in (or click regions below) to reveal state borders'
+              : 'Click any state/province to inspect details'}
           </div>
         </div>
       )}
